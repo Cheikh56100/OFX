@@ -4038,6 +4038,11 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                 return f"{yyyy}{mm}{dd.zfill(2)}"
         return str(year)+'0101'
 
+    # Solde précédent (partagé entre toutes les pages)
+    _eco_prev_solde = None
+    # Flag pour ignorer la ligne complémentaire d'une paire B/O annulée
+    _eco_skip_next_bo = False
+
     for pw in pages_words:
         rows = group_words_by_row(pw, tol=4.0)
         i = 0
@@ -4073,28 +4078,10 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                 label = label + ' — ' + _type_labels.get(txn_type_suffix, txn_type_suffix)
 
             # ── Colonnes montants ────────────────────────────────────────────
-            # Format français :  Débit x0≈390–465 / Crédit x0≈465–535
-            # Format anglais Ecobank (relevé Mega Max type) :
-            #   Payments (débits)  x0 ≈ 340–420
-            #   Deposits (crédits) x0 ≈ 410–480
-            #   Balance            x0 ≈ 470+   → à exclure
-            if date_info[0] == 'en':
-                debit_words  = [w for w in row if 335 <= w['x0'] < 415]
-                credit_words = [w for w in row if 405 <= w['x0'] < 476]
-                # Si rien dans la fenêtre étroite, élargir (pages à zoom différent)
-                if not debit_words and not credit_words:
-                    debit_words  = [w for w in row if 330 <= w['x0'] < 470 and w['x0'] < 450]
-                    credit_words = [w for w in row if 400 <= w['x0'] < 476]
-            else:
-                debit_words  = [w for w in row if 390 <= w['x0'] < 465]
-                credit_words = [w for w in row if 465 <= w['x0'] < 535]
-
-            # Montants en format anglais : "XOF6,500.00" → parse_amount gère déjà
             def _eco_parse_en(words):
+                """Parse un montant XOF anglais : 'XOF6,500.00' → 6500.0"""
                 full = ' '.join(w['text'] for w in words).strip()
-                # Retirer le préfixe devise "XOF"
                 full = re.sub(r'^XOF', '', full, flags=re.IGNORECASE).strip()
-                # Format "6,500.00" → remplacer virgule-milliers, point-décimal
                 full = full.replace(',', '')
                 try:
                     v = float(full)
@@ -4103,12 +4090,85 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                     return None
 
             if date_info[0] == 'en':
-                debit_amt  = _eco_parse_en(debit_words)
-                credit_amt = _eco_parse_en(credit_words)
+                # ── Format anglais Ecobank ──────────────────────────────────
+                # Colonnes exactes (mesurées sur le PDF) :
+                #   Payments  x0 ≈ 357  (<410) → DÉBIT
+                #   Deposits  x0 ≈ 417  (≥410, <476) → CRÉDIT
+                #   Balance   x0 ≈ 476  (≥476) → solde, à exclure
+                #
+                # Cas spécial : paire d'écritures B/O annulée
+                #   Ligne 1 : tiret "-" dans Payments + solde → écriture d'annulation
+                #   Ligne 2 : montant XOF dans Payments → écriture complémentaire
+                #   Ces deux lignes se compensent (net = 0) → à ignorer toutes les deux.
+                #
+                # Tokens fusionnés (ex. "XOF3,000,000.00XOF8,224,583.00") :
+                #   → 1er montant = opération, 2ème = solde
+
+                def _eco_split_xof(text):
+                    """Renvoie (montant_op, solde_opt) depuis un token XOF éventuellement fusionné."""
+                    hits = re.findall(r'XOF([\d,]+\.?\d*)', text, re.IGNORECASE)
+                    if not hits:
+                        return None, None
+                    vals = [float(h.replace(',', '')) for h in hits]
+                    return (vals[0], vals[1]) if len(vals) >= 2 else (vals[0], None)
+
+                # Détecter ligne d'annulation : tiret "-" dans zone Payments, aucun XOF op
+                dash_in_pay = any(
+                    w['text'] == '-' and 330 <= w['x0'] < 476 for w in row
+                )
+
+                xof_tokens = sorted(
+                    [w for w in row if 'XOF' in w['text'] and w['x0'] >= 335],
+                    key=lambda w: w['x0']
+                )
+                op_amt    = None
+                cur_solde = None
+                col_x0    = 0
+
+                for w in xof_tokens:
+                    v1, v2 = _eco_split_xof(w['text'])
+                    if v2 is not None:          # token fusionné
+                        op_amt    = v1
+                        cur_solde = v2
+                        col_x0    = w['x0']
+                    elif w['x0'] >= 476:        # colonne Balance
+                        cur_solde = v1
+                    else:
+                        if v1 and v1 > 0:
+                            op_amt = v1
+                            col_x0 = w['x0']
+
+                if cur_solde is not None:
+                    _eco_prev_solde = cur_solde
+
+                # Ligne d'annulation (tiret) → ignorer + marquer la suivante
+                if dash_in_pay and op_amt is None:
+                    _eco_skip_next_bo = True
+                    continue
+
+                # Ligne complémentaire d'une paire annulée → ignorer
+                if _eco_skip_next_bo and 'B/O' in label.upper():
+                    _eco_skip_next_bo = False
+                    continue
+                _eco_skip_next_bo = False
+
+                date_ofx = _eco_date_ofx(date_info)
+                name, memo = smart_label(label, memo_parts)
+
+                if op_amt and op_amt > 0:
+                    if col_x0 >= 410:
+                        txns.append(_make_txn(date_ofx, op_amt, name, memo))   # CRÉDIT
+                    else:
+                        txns.append(_make_txn(date_ofx, -op_amt, name, memo))  # DÉBIT
+
+                continue  # passer le bloc format français ci-dessous
+
             else:
+                # ── Format français Ecobank ─────────────────────────────────
+                debit_words  = [w for w in row if 390 <= w['x0'] < 465]
+                credit_words = [w for w in row if 465 <= w['x0'] < 535]
                 debit_amt  = _uba_join_amount(debit_words)
                 credit_amt = _uba_join_amount(credit_words)
-                # Montant négatif dans colonne débit = remboursement (crédit)
                 if debit_amt is None:
                     raw_d = ' '.join(w['text'] for w in debit_words)
                     if '- ' in raw_d or raw_d.strip().startswith('-'):
@@ -4116,12 +4176,12 @@ def parse_ecobank(pages_words, pages_text, _pdf_path=''):
                         try: credit_amt = float(nums); debit_amt = None
                         except: pass
 
-            date_ofx = _eco_date_ofx(date_info)
-            name, memo = smart_label(label, memo_parts)
-            if debit_amt and debit_amt > 0:
-                txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
-            elif credit_amt and credit_amt > 0:
-                txns.append(_make_txn(date_ofx, credit_amt, name, memo))
+                date_ofx = _eco_date_ofx(date_info)
+                name, memo = smart_label(label, memo_parts)
+                if debit_amt and debit_amt > 0:
+                    txns.append(_make_txn(date_ofx, -debit_amt, name, memo))
+                elif credit_amt and credit_amt > 0:
+                    txns.append(_make_txn(date_ofx, credit_amt, name, memo))
 
     # Fallback universel si rien extrait
     if not txns and _pdf_path and Path(_pdf_path).exists():
